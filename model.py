@@ -167,7 +167,7 @@ class FeedForward(nn.Module):
         if args.ffn_dim_multiplier is not None:
             hidden_dim = int(args.ffn_dim_multiplier * hidden_dim)
         # Round the hidden_dim to the nearest multiple of the multiple_of parameter
-        hidden = args.multiple_of * ((hidden + args.multiple_of - 1) // args.multiple_of)
+        hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1) // args.multiple_of)
 
         self.w1 = nn.Linear(args.dim , hidden_dim ,bias = False)
         self.w2 = nn.Linear(hidden_dim , args.dim ,bias = False)
@@ -244,4 +244,3 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h).float()
         return output
-    
