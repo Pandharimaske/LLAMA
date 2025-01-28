@@ -55,6 +55,18 @@ def apply_rotary_embeddings(x:torch.Tensor , freqs_complex: torch.Tensor , devic
     x_out = x_out.reshape(*x.shape)
     return x_out.type_as(x).to(device)
 
+def repeat_kv(x : torch.Tensor , n_rep:int) -> torch.Tensor:
+    batch_size , seq_len , n_kv_heads , head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        # (B , Seq_Len , N_KV_Heads , 1 , Head_dim)
+        x[: , : , : , None , :]
+        .expand(batch_size , seq_len , n_kv_heads , n_rep , head_dim)
+        .reshape(batch_size , seq_len , n_kv_heads * n_rep , head_dim)
+    )
+
+
 class RMSNorm(nn.Module):
 
     def __init__(self , dim: int , eps: float = 1e-6):
@@ -72,6 +84,103 @@ class RMSNorm(nn.Module):
         # rsqrt = 1 / sqrt(x)
         return self.weight * self._norm(x.float()).type_as(x)
     
+class SelfAttention(nn.Module):
+
+    def __init__(self , args:ModelArgs):
+        super().__init__()
+
+        # Indicates the number of heads for the key and values
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        # Indicates the number of heads for queries
+        self.n_heads_q = args.n_heads
+        # Indicates how many times the head of Keys and Values should be repeated to match the head of the Queries
+        self.n_rep = self.n_heads_q // self.n_kv_heads
+        # Indicates the dimension of each head
+        self.head_dim = args.dim // args.n_heads
+
+        self.wq = nn.Linear(args.dim , args.n_heads * self.head_dim , bias = False)
+        self.wk = nn.Linear(args.dim , self.n_kv_heads * self.head_dim , bias = False)
+        self.wv = nn.Linear(args.dim , self.n_kv_heads * self.head_dim , bias = False)
+        self.wo = nn.Linear(args.n_heads * self.head_dim , args.dim , bias = False)
+
+        self.cache_k = torch.zeros((args.max_batch_size , args.max_seq_len , self.n_kv_heads , self.head_dim))
+        self.cache_v = torch.zeros((args.max_batch_size , args.max_seq_len , self.n_kv_heads , self.head_dim))
+
+    def forward(self , x: torch.Tensor , start_pos:int , freqs_complex: torch.Tensor):
+        batch_size , seq_len , _ = x.shape # (B , 1 , Dim)
+
+        # Apply the Wq , Wk ,Wv matrices to queris , key and values
+        # (B , 1 , Dim) -> (B , 1 , H_Q * Head_Dim)
+        xq = self.wq(x)
+        # (B , 1 , Dim) -> (B , 1 , H_KV * Head_Dim)
+        xk = self.wk(x)
+        xv = self.wv(x)
+
+        # (B , 1 , H_Q * Head_Dim) --> (B , 1 , H_Q , Head_Dim)
+        xq = xq.view(batch_size , seq_len , self.n_heads_q , self.head_dim)
+        # (B , 1 , H_KV * Head_Dim) --> (B , 1 , H_KV , Head_Dim)
+        xk = xk.view(batch_size , seq_len , self.n_kv_heads , self.head_dim)
+        xv = xv.view(batch_size , seq_len , self.n_kv_heads , self.head_dim)
+
+        # Does not change the shape of the tensors
+        xq = apply_rotary_embeddings(xq , freqs_complex , device=x.device)
+        xk = apply_rotary_embeddings(xk , freqs_complex , device=x.device)
+
+        # Replace the entry in the cache for this token
+        self.cache_k[:batch_size , start_pos: start_pos + seq_len] = xk
+        self.cache_v[:batch_size , start_pos : start_pos + seq_len] = xv
+
+        # Retrieve all the cached keys and values so far
+        # (B , Seq_Len_KV , H_KV , Head_Dim)
+        keys = self.cache_k[:batch_size , 0: start_pos + seq_len]
+        values = self.cache_v[:batch_size , 0: start_pos + seq_len]
+
+        # Repeate the heads of the K and V to reach the number of heads of the queries
+        keys = repeat_kv(keys , self.n_rep)
+        values = repeat_kv(values , self.n_rep)
+
+        # (B , 1 , H_Q , Head_Dim) --> (B , H_Q , 1 , Head_Dim)
+        xq = xq.transpose(1 , 2)
+        keys = keys.transpose(1 , 2)
+        values = values.transpose(1 , 2)
+
+        # (B , H_Q , 1 , Head_Dim) @ (B , H_Q , Head_Dim , Seq_Len_KV) --> (B , H_Q , 1 , Seq_Len_KV)
+        scores = torch.matmul(xq , keys.transpose(2 , 3)) / math.sqrt(self.head_dim)
+        scores = F.softmax(scores.float() , dim = -1).type_as(xq)
+
+        # (B , H_Q , 1 , Seq_Len) @ (B , H_Q , Seq_Len_KV , Head_Dim) ==> (B , H_Q , 1 , Head_Dim)
+        output = torch.matmul(scores , values)
+
+        # (B , H_Q , 1 , Head_Dim) -> (B , 1 , H_Q , Head_Dim) -> (B , 1 , Dim)
+        output = (output.transpose(1 , 2).contiguous().view(batch_size , seq_len , -1))
+        return self.wo(output) # (B , 1 , Dim) -> (B , 1 , Dim)
+
+
+
+class FeedForward(nn.Module):
+
+    def __init__(self , args: ModelArgs):
+        super().__init__()
+
+        hidden_dim = 4 * args.dim
+        hidden_dim = int(2 * hidden_dim / 3)
+        if args.ffn_dim_multiplier is not None:
+            hidden_dim = int(args.ffn_dim_multiplier * hidden_dim)
+        # Round the hidden_dim to the nearest multiple of the multiple_of parameter
+        hidden = args.multiple_of * ((hidden + args.multiple_of - 1) // args.multiple_of)
+
+        self.w1 = nn.Linear(args.dim , hidden_dim ,bias = False)
+        self.w2 = nn.Linear(hidden_dim , args.dim ,bias = False)
+        self.w3 = nn.Linear(args.dim , hidden_dim ,bias = False)
+
+    def forward(self , x: torch.Tensor):
+        swish = F.silu(self.w1(x))
+        x_V = self.w3(x)
+        x = swish * x_V
+        x = self.w2(x)
+        return x
+    
+
 class EncoderBlock(nn.Module):
 
     def __init__(self , args:ModelArgs):
@@ -112,8 +221,7 @@ class Transformer(nn.Module):
 
         self.layers = nn.ModuleList()
         for _ in range(args.n_layers):
-            self.layers.append(EncoderBLock(args))
-        
+            self.layers.append(EncoderBlock(args))
         self.norm = RMSNorm(args.dim , eps = args.norm_eps)
         self.output = nn.Linear(args.dim , self.vocab_size , bias = False)
 
